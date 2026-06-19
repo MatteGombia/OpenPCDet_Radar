@@ -14,13 +14,9 @@ from .pandaset.pandaset_dataset import PandasetDataset
 from .lyft.lyft_dataset import LyftDataset
 from .once.once_dataset import ONCEDataset
 from .argo2.argo2_dataset import Argo2Dataset
-from .our_data.custom_dataset import CustomDataset
-#from .custom.custom_dataset import CustomDataset
+from .custom.custom_dataset import CustomDataset
 from .truckscenes.truckscenes_dataset import TruckScenesDataset
 from .truckscenes_multiradar.truckscenes_dataset import TruckScenesMultiRadarDataset
-from .truckscenes_multiradar_cars.truckscenes_dataset import TruckScenesMultiRadarCarsDataset
-from .truckscenes_cars.truckscenes_dataset import TruckScenesCarsDataset
-from .truckscenes_multiradar_cars_comp.truckscenes_dataset import TruckScenesMultiRadarCarsCompDataset
 
 
 __all__ = {
@@ -36,9 +32,6 @@ __all__ = {
     'Argo2Dataset': Argo2Dataset,
     'TruckScenesDataset': TruckScenesDataset,
     'TruckScenesMultiRadarDataset': TruckScenesMultiRadarDataset,
-    'TruckScenesMultiRadarCarsDataset': TruckScenesMultiRadarCarsDataset,
-    'TruckScenesCarsDataset': TruckScenesCarsDataset,
-    'TruckScenesMultiRadarCarsCompDataset': TruckScenesMultiRadarCarsCompDataset
 }
 
 
