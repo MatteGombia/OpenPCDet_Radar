@@ -10,10 +10,10 @@ from ...utils import common_utils
 from ..dataset import DatasetTemplate
 from pyquaternion import Quaternion
 from PIL import Image
-from nuscenes.utils.data_classes import RadarPointCloud
+from truckscenes.utils.data_classes import RadarPointCloud
 
 
-class NuScenesDataset(DatasetTemplate):
+class TruckScenesDataset(DatasetTemplate):
     def __init__(self, dataset_cfg, class_names, training=True, root_path=None, logger=None):
         root_path = (root_path if root_path is not None else Path(dataset_cfg.DATA_PATH)) / dataset_cfg.VERSION
         super().__init__(
@@ -27,13 +27,13 @@ class NuScenesDataset(DatasetTemplate):
         else:
             self.use_camera = False
 
-        self.include_nuscenes_data(self.mode)
+        self.include_truckscenes_data(self.mode)
         if self.training and self.dataset_cfg.get('BALANCED_RESAMPLING', False):
             self.infos = self.balanced_infos_resampling(self.infos)
 
-    def include_nuscenes_data(self, mode):
-        self.logger.info('Loading NuScenes dataset')
-        nuscenes_infos = []
+    def include_truckscenes_data(self, mode):
+        self.logger.info('Loading TruckScenes dataset')
+        truckscenes_infos = []
 
         for info_path in self.dataset_cfg.INFO_PATH[mode]:
             info_path = self.root_path / info_path
@@ -41,10 +41,10 @@ class NuScenesDataset(DatasetTemplate):
                 continue
             with open(info_path, 'rb') as f:
                 infos = pickle.load(f)
-                nuscenes_infos.extend(infos)
+                truckscenes_infos.extend(infos)
 
-        self.infos.extend(nuscenes_infos)
-        self.logger.info('Total samples for NuScenes dataset: %d' % (len(nuscenes_infos)))
+        self.infos.extend(truckscenes_infos)
+        self.logger.info('Total samples for TruckScenes dataset: %d' % (len(truckscenes_infos)))
 
     def balanced_infos_resampling(self, infos):
         """
@@ -104,42 +104,73 @@ class NuScenesDataset(DatasetTemplate):
         lidar_path = self.root_path / info['lidar_path']
 
         pc = RadarPointCloud.from_file(str(lidar_path))
-        points_raw = pc.points.T  # Shape becomes (N, 18)
-        
-        # Extract [x, y, z, rcs, vx_comp, vy_comp]
-        # nuScenes radar indices: 0=x, 1=y, 2=z, 5=rcs, 8=vx_comp, 9=vy_comp
-        points = points_raw[:, [0, 1, 2, 5, 8, 9]]
+        points = pc.points.T
+
+        v_ego_local = np.zeros(3)
+        if len(info['sweeps']) > 0:
+            v_x, v_y, v_z = self.compensate_ego_motion(points, info['sweeps'][0])
+
+            points[:, 3] = v_x
+            points[:, 4] = v_y
+            points[:, 5] = v_z
 
         sweep_points_list = [points]
         sweep_times_list = [np.zeros((points.shape[0], 1))]
 
-        for k in np.random.choice(len(info['sweeps']), max_sweeps - 1, replace=False):
-            is_valid_sweep = True
-            if len(info['sweeps']) == 0:
-                is_valid_sweep = False
-            else:
+        if max_sweeps > 1 and len(info['sweeps']) > 0:
+            #print(f"Sample {index} has {len(info['sweeps'])} sweeps, sampling up to {max_sweeps - 1} sweeps for augmentation.")
+            num_sweeps = len(info['sweeps'])
+            choices = np.random.choice(num_sweeps, max_sweeps - 1, replace=False)
+            
+            for k in choices:
                 sweep = info['sweeps'][k]
                 sweep_path = self.root_path / sweep['lidar_path']
-
                 sweep_pc = RadarPointCloud.from_file(str(sweep_path))
-                sweep_points_raw = sweep_pc.points.T
-                sweep_points = sweep_points_raw[:, [0, 1, 2, 5, 8, 9]]
+                sweep_points = sweep_pc.points.T
 
-                # If there is no matrix (e.g., first frame of a scene) -> skip the transformation
+                v_x, v_y, v_z = self.compensate_ego_motion(sweep_points, sweep)
+
+                sweep_points[:, 3] = v_x
+                sweep_points[:, 4] = v_y
+                sweep_points[:, 5] = v_z
+
                 if sweep['transform_matrix'] is not None:
                     sweep_points[:, :3] = sweep_points[:, :3] @ sweep['transform_matrix'][:3, :3].T
                     sweep_points[:, :3] += sweep['transform_matrix'][:3, 3]
+                    sweep_points[:, 3:6] = sweep_points[:, 3:6] @ sweep['transform_matrix'][:3, :3].T
 
                 sweep_points_list.append(sweep_points)
                 sweep_times_list.append(sweep['time_lag'] * np.ones((sweep_points.shape[0], 1)))
 
-        points = np.concatenate(sweep_points_list, axis=0)
-        times = np.concatenate(sweep_times_list, axis=0)
+        all_points = np.concatenate(sweep_points_list, axis=0)
+        all_times = np.concatenate(sweep_times_list, axis=0)
         
-        # Final shape: (N, 7) -> [x, y, z, rcs, vx_comp, vy_comp, time]
-        points = np.concatenate((points, times), axis=1)
-        
-        return points
+        combined = np.concatenate((all_points, all_times), axis=1)
+        final_points = combined[:, [0, 1, 2, 6, 3, 4, 7]]
+
+        return final_points.astype(np.float32)
+    
+    def compensate_ego_motion(self, points, info_sweep):
+        if info_sweep['transform_matrix'] is None or info_sweep['time_lag'] <= 0:
+            print(f"Warning: No valid transform matrix or non-positive time lag for ego motion compensation. Returning original velocities. {info_sweep}")
+            return points[:, 3], points[:, 4], points[:, 5]
+
+        translation = info_sweep['transform_matrix'][:3, 3]
+        v_ego_local = -translation / info_sweep['time_lag']
+        #print(f"Ego velocity (local): {v_ego_local}, time lag: {info_sweep['time_lag']}")
+        #print(f"Mean speed before compensation: {np.mean(points[:, 3])} {np.mean(points[:, 4])} {np.mean(points[:, 5])}")
+
+        d = np.linalg.norm(points[:, :3], axis=1)
+        ux = points[:, 0] / (d[:] + 1e-8)
+        uy = points[:, 1] / (d[:] + 1e-8)
+        uz = points[:, 2] / (d[:] + 1e-8)
+
+        v_ego_local_points = ux * v_ego_local[0] + uy * v_ego_local[1] + uz * v_ego_local[2]
+        v_points = ux * points[:, 3] + uy * points[:, 4] + uz * points[:, 5]
+        v_comp = v_points + v_ego_local_points
+        #print(f"Mean speed after compensation: {np.mean(ux * v_comp)} {np.mean(uy * v_comp)} {np.mean(uz * v_comp)}")
+
+        return ux * v_comp, uy * v_comp, uz * v_comp
 
     def crop_image(self, input_dict):
         W, H = input_dict["ori_shape"]
@@ -306,10 +337,10 @@ class NuScenesDataset(DatasetTemplate):
 
     def evaluation(self, det_annos, class_names, **kwargs):
         import json
-        from nuscenes.nuscenes import NuScenes
-        from . import nuscenes_utils
-        nusc = NuScenes(version=self.dataset_cfg.VERSION, dataroot=str(self.root_path), verbose=True)
-        nusc_annos = nuscenes_utils.transform_det_annos_to_nusc_annos(det_annos, nusc)
+        from truckscenes.truckscenes import TruckScenes
+        from . import truckscenes_utils
+        nusc = TruckScenes(version=self.dataset_cfg.VERSION, dataroot=str(self.root_path), verbose=True)
+        nusc_annos = truckscenes_utils.transform_det_annos_to_nusc_annos(det_annos, nusc)
         nusc_annos['meta'] = {
             'use_camera': False,
             'use_lidar': False,
@@ -324,27 +355,27 @@ class NuScenesDataset(DatasetTemplate):
         with open(res_path, 'w') as f:
             json.dump(nusc_annos, f)
 
-        self.logger.info(f'The predictions of NuScenes have been saved to {res_path}')
+        self.logger.info(f'The predictions of TruckScenes have been saved to {res_path}')
 
-        if self.dataset_cfg.VERSION == 'v1.0-test':
+        if self.dataset_cfg.VERSION == 'v1.1-test':
             return 'No ground-truth annotations for evaluation', {}
 
-        from nuscenes.eval.detection.config import config_factory
-        from nuscenes.eval.detection.evaluate import NuScenesEval
+        from truckscenes.eval.detection.config import config_factory
+        from truckscenes.eval.detection.evaluate import TruckScenesEval
 
         eval_set_map = {
-            'v1.0-mini': 'mini_val',
-            'v1.0-trainval': 'val',
-            'v1.0-test': 'test'
+            'v1.1-mini': 'mini_val',
+            'v1.1-trainval': 'val',
+            'v1.1-test': 'test'
         }
         try:
-            eval_version = 'detection_cvpr_2019'
+            eval_version = 'detection_cvpr_2024'
             eval_config = config_factory(eval_version)
         except:
-            eval_version = 'cvpr_2019'
+            eval_version = 'cvpr_2024'
             eval_config = config_factory(eval_version)
 
-        nusc_eval = NuScenesEval(
+        nusc_eval = TruckScenesEval(
             nusc,
             config=eval_config,
             result_path=res_path,
@@ -357,14 +388,14 @@ class NuScenesDataset(DatasetTemplate):
         with open(output_path / 'metrics_summary.json', 'r') as f:
             metrics = json.load(f)
 
-        result_str, result_dict = nuscenes_utils.format_nuscene_results(metrics, self.class_names, version=eval_version)
+        result_str, result_dict = truckscenes_utils.format_truckscenes_results(metrics, self.class_names, version=eval_version)
         return result_str, result_dict
 
     def create_groundtruth_database(self, used_classes=None, max_sweeps=10):
         import torch
 
         database_save_path = self.root_path / f'gt_database_{max_sweeps}sweeps_withvelo'
-        db_info_save_path = self.root_path / f'nuscenes_dbinfos_{max_sweeps}sweeps_withvelo.pkl'
+        db_info_save_path = self.root_path / f'truckscenes_dbinfos_{max_sweeps}sweeps_withvelo.pkl'
 
         database_save_path.mkdir(parents=True, exist_ok=True)
         all_db_infos = {}
@@ -405,28 +436,28 @@ class NuScenesDataset(DatasetTemplate):
             pickle.dump(all_db_infos, f)
 
 
-def create_nuscenes_info(version, data_path, save_path, max_sweeps=10, with_cam=False):
-    from nuscenes.nuscenes import NuScenes
-    from nuscenes.utils import splits
-    from . import nuscenes_utils
+def create_truckscenes_info(version, data_path, save_path, max_sweeps=10, with_cam=False):
+    from truckscenes.truckscenes import TruckScenes
+    from truckscenes.utils import splits
+    from . import truckscenes_utils
     data_path = data_path / version
     save_path = save_path / version
 
-    assert version in ['v1.0-trainval', 'v1.0-test', 'v1.0-mini']
-    if version == 'v1.0-trainval':
+    assert version in ['v1.1-trainval', 'v1.1-test', 'v1.1-mini']
+    if version == 'v1.1-trainval':
         train_scenes = splits.train
         val_scenes = splits.val
-    elif version == 'v1.0-test':
+    elif version == 'v1.1-test':
         train_scenes = splits.test
         val_scenes = []
-    elif version == 'v1.0-mini':
+    elif version == 'v1.1-mini':
         train_scenes = splits.mini_train
         val_scenes = splits.mini_val
     else:
         raise NotImplementedError
 
-    nusc = NuScenes(version=version, dataroot=data_path, verbose=True)
-    available_scenes = nuscenes_utils.get_available_scenes(nusc)
+    nusc = TruckScenes(version=version, dataroot=data_path, verbose=True)
+    available_scenes = truckscenes_utils.get_available_scenes(nusc)
     available_scene_names = [s['name'] for s in available_scenes]
     train_scenes = list(filter(lambda x: x in available_scene_names, train_scenes))
     val_scenes = list(filter(lambda x: x in available_scene_names, val_scenes))
@@ -435,20 +466,20 @@ def create_nuscenes_info(version, data_path, save_path, max_sweeps=10, with_cam=
 
     print('%s: train scene(%d), val scene(%d)' % (version, len(train_scenes), len(val_scenes)))
 
-    train_nusc_infos, val_nusc_infos = nuscenes_utils.fill_trainval_infos(
+    train_nusc_infos, val_nusc_infos = truckscenes_utils.fill_trainval_infos(
         data_path=data_path, nusc=nusc, train_scenes=train_scenes, val_scenes=val_scenes,
         test='test' in version, max_sweeps=max_sweeps, with_cam=with_cam
     )
 
-    if version == 'v1.0-test':
+    if version == 'v1.1-test':
         print('test sample: %d' % len(train_nusc_infos))
-        with open(save_path / f'nuscenes_infos_{max_sweeps}sweeps_test.pkl', 'wb') as f:
+        with open(save_path / f'truckscenes_infos_{max_sweeps}sweeps_test.pkl', 'wb') as f:
             pickle.dump(train_nusc_infos, f)
     else:
         print('train sample: %d, val sample: %d' % (len(train_nusc_infos), len(val_nusc_infos)))
-        with open(save_path / f'nuscenes_infos_{max_sweeps}sweeps_train.pkl', 'wb') as f:
+        with open(save_path / f'truckscenes_infos_{max_sweeps}sweeps_train.pkl', 'wb') as f:
             pickle.dump(train_nusc_infos, f)
-        with open(save_path / f'nuscenes_infos_{max_sweeps}sweeps_val.pkl', 'wb') as f:
+        with open(save_path / f'truckscenes_infos_{max_sweeps}sweeps_val.pkl', 'wb') as f:
             pickle.dump(val_nusc_infos, f)
 
 
@@ -460,26 +491,26 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='arg parser')
     parser.add_argument('--cfg_file', type=str, default=None, help='specify the config of dataset')
-    parser.add_argument('--func', type=str, default='create_nuscenes_infos', help='')
-    parser.add_argument('--version', type=str, default='v1.0-trainval', help='')
+    parser.add_argument('--func', type=str, default='create_truckscenes_infos', help='')
+    parser.add_argument('--version', type=str, default='v1.1-trainval', help='')
     parser.add_argument('--with_cam', action='store_true', default=False, help='use camera or not')
     args = parser.parse_args()
 
-    if args.func == 'create_nuscenes_infos':
+    if args.func == 'create_truckscenes_infos':
         dataset_cfg = EasyDict(yaml.safe_load(open(args.cfg_file)))
         ROOT_DIR = (Path(__file__).resolve().parent / '../../../').resolve()
         dataset_cfg.VERSION = args.version
-        create_nuscenes_info(
+        create_truckscenes_info(
             version=dataset_cfg.VERSION,
-            data_path=ROOT_DIR / 'data' / 'nuscenes',
-            save_path=ROOT_DIR / 'data' / 'nuscenes',
+            data_path=ROOT_DIR / 'data' / 'truckscenes',
+            save_path=ROOT_DIR / 'data' / 'truckscenes',
             max_sweeps=dataset_cfg.MAX_SWEEPS,
             with_cam=args.with_cam
         )
 
-        nuscenes_dataset = NuScenesDataset(
+        truckscenes_dataset = TruckScenesDataset(
             dataset_cfg=dataset_cfg, class_names=None,
-            root_path=ROOT_DIR / 'data' / 'nuscenes',
+            root_path=ROOT_DIR / 'data' / 'truckscenes',
             logger=common_utils.create_logger(), training=True
         )
-        nuscenes_dataset.create_groundtruth_database(max_sweeps=dataset_cfg.MAX_SWEEPS)
+        truckscenes_dataset.create_groundtruth_database(max_sweeps=dataset_cfg.MAX_SWEEPS)

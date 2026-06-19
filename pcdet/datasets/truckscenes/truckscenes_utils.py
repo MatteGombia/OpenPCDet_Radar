@@ -9,36 +9,81 @@ from pathlib import Path
 
 import numpy as np
 import tqdm
-from nuscenes.utils.data_classes import Box
-from nuscenes.utils.geometry_utils import transform_matrix
+from truckscenes.utils.data_classes import Box
+from truckscenes.utils.geometry_utils import transform_matrix
 from pyquaternion import Quaternion
 
+DefaultAttribute = {
+            "car": "vehicle.moving",
+            "truck": "vehicle.moving",
+            "bus": "vehicle.moving",
+            "trailer": "vehicle.parked",
+            "other_vehicle": "vehicle.moving",
+            "motorcycle": "vehicle.moving",
+            "bicycle": "cycle.with_rider",
+            "pedestrian": "pedestrian.moving",
+            "traffic_cone": "traffic_sign.temporary",
+            "barrier": "",
+            "animal": "",
+            "traffic_sign": "traffic_sign.pole_mounted"
+        }
+
+# map_name_from_general_to_detection = {
+#     'human.pedestrian.adult': 'pedestrian',
+#     'human.pedestrian.child': 'pedestrian',
+#     'human.pedestrian.wheelchair': 'ignore',
+#     'human.pedestrian.stroller': 'ignore',
+#     'human.pedestrian.personal_mobility': 'ignore',
+#     'human.pedestrian.police_officer': 'pedestrian',
+#     'human.pedestrian.construction_worker': 'pedestrian',
+#     'animal': 'ignore',
+#     'vehicle.car': 'car',
+#     'vehicle.motorcycle': 'motorcycle',
+#     'vehicle.bicycle': 'bicycle',
+#     'vehicle.bus.bendy': 'bus',
+#     'vehicle.bus.rigid': 'bus',
+#     'vehicle.truck': 'truck',
+#     'vehicle.construction': 'construction_vehicle',
+#     'vehicle.emergency.ambulance': 'ignore',
+#     'vehicle.emergency.police': 'ignore',
+#     'vehicle.trailer': 'trailer',
+#     'movable_object.barrier': 'barrier',
+#     'movable_object.trafficcone': 'traffic_cone',
+#     'movable_object.pushable_pullable': 'ignore',
+#     'movable_object.debris': 'ignore',
+#     'static_object.bicycle_rack': 'ignore',
+# }
+
 map_name_from_general_to_detection = {
+    'animal': 'animal',
     'human.pedestrian.adult': 'pedestrian',
     'human.pedestrian.child': 'pedestrian',
-    'human.pedestrian.wheelchair': 'ignore',
+    'human.pedestrian.construction': 'pedestrian',  
+    'human.pedestrian.construction_worker': 'pedestrian', 
     'human.pedestrian.stroller': 'ignore',
+    'human.pedestrian.wheelchair': 'ignore',
     'human.pedestrian.personal_mobility': 'ignore',
     'human.pedestrian.police_officer': 'pedestrian',
-    'human.pedestrian.construction_worker': 'pedestrian',
-    'animal': 'ignore',
-    'vehicle.car': 'car',
-    'vehicle.motorcycle': 'motorcycle',
-    'vehicle.bicycle': 'bicycle',
-    'vehicle.bus.bendy': 'bus',
-    'vehicle.bus.rigid': 'bus',
-    'vehicle.truck': 'truck',
-    'vehicle.construction': 'construction_vehicle',
-    'vehicle.emergency.ambulance': 'ignore',
-    'vehicle.emergency.police': 'ignore',
-    'vehicle.trailer': 'trailer',
     'movable_object.barrier': 'barrier',
     'movable_object.trafficcone': 'traffic_cone',
     'movable_object.pushable_pullable': 'ignore',
     'movable_object.debris': 'ignore',
+    'static_object.traffic_sign': 'traffic_sign',
     'static_object.bicycle_rack': 'ignore',
+    'vehicle.bicycle': 'bicycle',
+    'vehicle.bus.bendy': 'bus',
+    'vehicle.bus.rigid': 'bus',
+    'vehicle.car': 'car',
+    'vehicle.construction': 'other_vehicle', 
+    'vehicle.ego_trailer': 'ignore',
+    'vehicle.motorcycle': 'motorcycle',
+    'vehicle.other': 'other_vehicle',
+    'vehicle.trailer': 'trailer',
+    'vehicle.train': 'ignore', 
+    'vehicle.truck': 'truck',
+    'vehicle.emergency.ambulance': 'ignore',
+    'vehicle.emergency.police': 'ignore',
 }
-
 
 cls_attr_dist = {
     'barrier': {
@@ -161,7 +206,7 @@ def get_available_scenes(nusc):
         scene_token = scene['token']
         scene_rec = nusc.get('scene', scene_token)
         sample_rec = nusc.get('sample', scene_rec['first_sample_token'])
-        sd_rec = nusc.get('sample_data', sample_rec['data']['RADAR_FRONT'])
+        sd_rec = nusc.get('sample_data', sample_rec['data']['RADAR_LEFT_FRONT'])
         has_more_frames = True
         scene_not_exist = False
         while has_more_frames:
@@ -314,8 +359,8 @@ def fill_trainval_infos(data_path, nusc, train_scenes, val_scenes, test=False, m
     val_nusc_infos = []
     progress_bar = tqdm.tqdm(total=len(nusc.sample), desc='create_info', dynamic_ncols=True)
 
-    ref_chan = 'RADAR_FRONT'  # The radar channel from which we track back n sweeps to aggregate the point cloud.
-    chan = 'RADAR_FRONT'  # The reference channel of the current sample_rec that the point clouds are mapped to.
+    ref_chan = 'RADAR_LEFT_FRONT'  # The radar channel from which we track back n sweeps to aggregate the point cloud.
+    chan = 'RADAR_LEFT_FRONT'  # The reference channel of the current sample_rec that the point clouds are mapped to.
 
     for index, sample in enumerate(nusc.sample):
         progress_bar.update()
@@ -328,7 +373,7 @@ def fill_trainval_infos(data_path, nusc, train_scenes, val_scenes, test=False, m
 
         ref_lidar_path, ref_boxes, _ = get_sample_data(nusc, ref_sd_token)
 
-        ref_cam_front_token = sample['data']['CAM_FRONT']
+        ref_cam_front_token = sample['data']['CAMERA_LEFT_FRONT']
         ref_cam_path, _, ref_cam_intrinsic = nusc.get_sample_data(ref_cam_front_token)
 
         # Homogeneous transform from ego car frame to reference frame
@@ -362,12 +407,10 @@ def fill_trainval_infos(data_path, nusc, train_scenes, val_scenes, test=False, m
 
             # obtain 6 image's information per frame
             camera_types = [
-                "CAM_FRONT",
-                "CAM_FRONT_RIGHT",
-                "CAM_FRONT_LEFT",
-                "CAM_BACK",
-                "CAM_BACK_LEFT",
-                "CAM_BACK_RIGHT",
+                "CAMERA_LEFT_FRONT",
+                "CAMERA_RIGHT_FRONT",
+                "CAMERA_LEFT_BACK",
+                "CAMERA_RIGHT_BACK",
             ]
             for cam in camera_types:
                 cam_token = sample["data"][cam]
@@ -488,7 +531,7 @@ def boxes_lidar_to_nusenes(det_info):
 
 def lidar_nusc_box_to_global(nusc, boxes, sample_token):
     s_record = nusc.get('sample', sample_token)
-    sample_data_token = s_record['data']['RADAR_FRONT']
+    sample_data_token = s_record['data']['RADAR_LEFT_FRONT']
 
     sd_record = nusc.get('sample_data', sample_data_token)
     cs_record = nusc.get('calibrated_sensor', sd_record['calibrated_sensor_token'])
@@ -556,33 +599,33 @@ def transform_det_annos_to_nusc_annos(det_annos, nusc):
     return nusc_annos
 
 
-def format_nuscene_results(metrics, class_names, version='default'):
+def format_truckscenes_results(metrics, class_names, version='default'):
     result = '----------------Nuscene %s results-----------------\n' % version
     for name in class_names:
-        threshs = ', '.join(list(metrics['label_aps'][name].keys()))
-        ap_list = list(metrics['label_aps'][name].values())
+        threshs = ', '.join(list(metrics['all']['label_aps'][name].keys()))
+        ap_list = list(metrics['all']['label_aps'][name].values())
 
-        err_name =', '.join([x.split('_')[0] for x in list(metrics['label_tp_errors'][name].keys())])
-        error_list = list(metrics['label_tp_errors'][name].values())
+        err_name =', '.join([x.split('_')[0] for x in list(metrics['all']['label_tp_errors'][name].keys())])
+        error_list = list(metrics['all']['label_tp_errors'][name].values())
 
         result += f'***{name} error@{err_name} | AP@{threshs}\n'
         result += ', '.join(['%.2f' % x for x in error_list]) + ' | '
         result += ', '.join(['%.2f' % (x * 100) for x in ap_list])
-        result += f" | mean AP: {metrics['mean_dist_aps'][name]}"
+        result += f" | mean AP: {metrics['all']['mean_dist_aps'][name]}"
         result += '\n'
 
     result += '--------------average performance-------------\n'
     details = {}
-    for key, val in metrics['tp_errors'].items():
+    for key, val in metrics['all']['tp_errors'].items():
         result += '%s:\t %.4f\n' % (key, val)
         details[key] = val
 
-    result += 'mAP:\t %.4f\n' % metrics['mean_ap']
-    result += 'NDS:\t %.4f\n' % metrics['nd_score']
+    result += 'mAP:\t %.4f\n' % metrics['all']['mean_ap']
+    result += 'NDS:\t %.4f\n' % metrics['all']['nd_score']
 
     details.update({
-        'mAP': metrics['mean_ap'],
-        'NDS': metrics['nd_score'],
+        'mAP': metrics['all']['mean_ap'],
+        'NDS': metrics['all']['nd_score'],
     })
 
     return result, details
